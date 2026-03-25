@@ -2,7 +2,7 @@ name: Build, Scan, Deploy Angular app
 
 on:
   pull_request:
-    branches: [ "prod" ]
+    branches: [ "main" ]
     paths:
       - 'client/**'
   workflow_dispatch:
@@ -10,6 +10,7 @@ on:
 permissions:
   id-token: write
   contents: read
+  packages: write
 
 jobs:
   prepare:
@@ -63,7 +64,7 @@ jobs:
       
   build:
     runs-on: ubuntu-latest
-    environment: dev
+    environment: prod
     needs: [static-code-Analysis]
     steps:
       - uses: actions/checkout@v5.0.0
