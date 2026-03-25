@@ -1,0 +1,198 @@
+name: Build, Scan, Deploy node-api on dev
+
+on:
+  pull_request:
+    branches: [ "dev" ]
+  workflow_dispatch:
+
+jobs:
+  static-code-Analysis:
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v5.0.0
+        with:
+          fetch-tags: true
+          lfs: true
+          fetch-depth: 0  # Shallow clones should be disabled for a better relevancy of analysis
+          
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '16'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+        
+      - uses: SonarSource/sonarqube-scan-action@v6
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          
+      - name: Git Leak Scan
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          no-git: true
+          no-banner: true
+          
+  build:
+    runs-on: ubuntu-latest
+    environment: dev
+    needs: [static-code-Analysis]
+    steps:
+      - uses: actions/checkout@v5.0.0
+        with:
+          fetch-tags: true
+          lfs: true
+          fetch-depth: 0  # Shallow clones should be disabled for a better relevancy of analysis
+          
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '16'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build project 
+        run: npm run build --prod
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: node-build-artifacts
+          path: dist/
+          
+  docker:
+    name: Docker Build and Push
+    runs-on: ubuntu-latest
+    environment: dev
+    needs: [build]
+    env:
+      REGISTRY: ghcr.io
+      IMAGE_NAME: ${{ github.repository }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v5.0.0
+      with: 
+          fetch-tags: true
+          lfs: true
+          fetch-depth: 0 
+          
+    - name: Download build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: node-build-artifacts
+        path: dist/
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3.11.1
+
+    - name: Login to GitHub Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.TOKEN }}
+
+    - name: Extract metadata for Docker
+      id: meta
+      uses: docker/metadata-action@v5.8.0
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        flavor: |
+          latest=false
+          
+        tags: |
+          type=sha,format=short
+          type=ref,event=branch
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=semver,pattern={{major}}
+          type=raw,value=latest
+          type=raw,value=commit-${{ github.sha }}
+          type=raw,value=${{ github.run_number }}
+
+    - name: Build Docker Image (without push)
+      uses: docker/build-push-action@v6.18.0
+      with:
+        context: .
+        push: false
+        tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:local-test
+        load: true
+
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:local-test
+        severity: 'CRITICAL,HIGH'
+        output: 'trivy-results.sarif'
+        format: 'sarif'
+
+    - name: Push Docker image with all tags
+      uses: docker/build-push-action@v6.18.0
+      with:
+        context: .
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+    
+    - name: Set image tag output
+      id: set_output
+      run: |
+        echo "image_tag=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+
+  update_k8s_manifest:
+    name: Update k8s repository
+    runs-on: ubuntu-latest
+    environment: dev
+    needs: [docker]
+    #if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout k8s manifest repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.MANIFEST_REPO }}  # Your k8s manifests repo
+          token: ${{ secrets.TOKEN }}
+          path: manifests
+          ref: dev
+
+      - name: Update Kubernetes deployment file
+        env:
+          IMAGE_TAG: sha-${{ github.sha }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          REGISTRY: ghcr.io
+        run: |
+          # Define the new image with tag
+          NEW_IMAGE="${REGISTRY}/${GITHUB_REPOSITORY}:${IMAGE_TAG}"
+
+          echo "New image: $NEW_IMAGE"
+
+          # Confirm you’re in the right directory
+          ls -la manifests/kubernetes-manifest/base
+          
+          # Update the deployment file directly
+          sed -i "s|image: .*|image: ${NEW_IMAGE}|g" manifests/kubernetes-manifest/base/apideploy.yaml
+          
+          # Verify the change
+          echo "Updated deployment to use image: ${NEW_IMAGE}"
+          grep -A 1 "image:" manifests/kubernetes-manifest/base/apideploy.yaml
+
+      - name: Commit and push changes
+        run: |
+
+          ls -la 
+          cd manifests
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add .
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "ci: update ${{ github.repository }} image to ${{ github.sha }}"
+            git push
+            echo "Successfully updated Kubernetes manifests for production"
+          fi 
