@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: prod
     steps:
-      - uses: actions/checkout@v5.0.0
+      - uses: actions/checkout@v4
         with:
           fetch-tags: true
           lfs: true
@@ -28,8 +28,10 @@ jobs:
         with:
           node-version: '16'
           cache: 'npm'
+          cache-dependency-path: 'client/package-lock.json'
       
       - name: Install dependencies
+        working-directory: ./client
         run: npm ci
 
   static-code-Analysis:
@@ -37,17 +39,17 @@ jobs:
     environment: prod
     needs: prepare
     steps:
-      - uses: actions/checkout@v5.0.0
-        with:
-          fetch-depth: 0
+      - uses: actions/checkout@v4
         
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '16'
           cache: 'npm'
+          cache-dependency-path: 'client/package-lock.json'
       
       - name: Install dependencies
+        working-directory: ./client
         run: npm ci
 
       # - uses: SonarSource/sonarqube-scan-action@v6
@@ -58,41 +60,40 @@ jobs:
       - name: Git Leak Scan
         uses: gitleaks/gitleaks-action@v2
         with:
-          args: detect --source . --no-git --report-format json --report-path gitleaks-report.json
+          config: .gitleaks.toml
 
-      - run: npm run lint
+      - name: Lint
+        working-directory: ./client
+        run: npm run lint
       
   build:
     runs-on: ubuntu-latest
     environment: prod
     needs: [static-code-Analysis]
     steps:
-      - uses: actions/checkout@v5.0.0
+      - uses: actions/checkout@v4
           
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '16'
           cache: 'npm'
+          cache-dependecy-path: 'client/package-lock.json
       
       - name: Install dependencies
         run: npm ci
+        working-directory: ./client
 
       - name: Build project
+        working-directory: ./client
         run: npm run build --prod
-
-      - name: Verify app starts
-        run: |
-          npm start &
-          sleep 5
-          curl -f http://localhost:4200 || echo "App did not respond on port 3000"
-          pkill node || true
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4.6.2
         with:
-          name: tsx-build-artifacts
-          path: dist/
+          name: angular-dist
+          path: client/dist/
+          retention-days: 7
           
   docker:
     name: Docker Build and Push
@@ -113,8 +114,8 @@ jobs:
 
     - uses: actions/download-artifact@v4
       with:
-        name: tsx-build-artifacts
-        path: dist/
+        name: angular-dist
+        path: client/dist/
 
     - name: Login to GHCR
       uses: docker/login-action@v3
@@ -124,7 +125,7 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3.11.1
+      uses: docker/setup-buildx-action@v3
 
     - name: Docker Build
       run: docker build -t ${{ env.REGISTRY }}/${{ github.repository }}:${{ env.IMAGE_TAG }} .
